@@ -5,218 +5,486 @@ import IOBluetooth
 private let devicesBatteryServiceID = "180F"
 private let devicesBatteryLevelCharacteristicID = "2A19"
 
+private struct DeviceDiscoverySource: OptionSet, Equatable {
+    let rawValue: Int
+
+    static let ioBluetooth = DeviceDiscoverySource(rawValue: 1 << 0)
+    static let ble = DeviceDiscoverySource(rawValue: 1 << 1)
+}
+
 struct DeviceBatteryInfo: Identifiable, Equatable {
-    let id: String                 // stable key: BT addressString OR peripheral UUID string
+    let id: String
     var name: String
     var batteryPercent: Int?
     var lastUpdated: Date?
     var isConnected: Bool
+    var address: String?
+    var peripheralIdentifier: UUID?
+    fileprivate var sources: DeviceDiscoverySource = []
+}
+
+struct IOBluetoothAudioDeviceSnapshot: Equatable {
+    let name: String
+    let address: String?
+    let batteryPercent: Int?
+    let isConnected: Bool
+}
+
+struct BLEBatteryUpdate: Equatable {
+    let name: String
+    let peripheralIdentifier: UUID
+    let batteryPercent: Int?
+    let isConnected: Bool
+}
+
+struct DeviceBatteryStore {
+    private(set) var devices: [DeviceBatteryInfo] = []
+
+    var connectedDevices: [DeviceBatteryInfo] {
+        devices.filter(\.isConnected)
+    }
+
+    mutating func clear() {
+        devices.removeAll()
+    }
+
+    mutating func applyIOBluetoothSnapshots(_ snapshots: [IOBluetoothAudioDeviceSnapshot], now: Date) {
+        var seenAddresses = Set<String>()
+        var seenFallbackIDs = Set<String>()
+
+        for snapshot in snapshots where snapshot.isConnected {
+            let normalizedAddress = Self.normalizedAddress(snapshot.address)
+            let fallbackID = Self.fallbackIdentifier(name: snapshot.name)
+            let existingDevice = device(at: indexForIOBluetoothSnapshot(snapshot))
+
+            if let normalizedAddress {
+                seenAddresses.insert(normalizedAddress)
+            } else {
+                seenFallbackIDs.insert(fallbackID)
+            }
+
+            let index = indexForIOBluetoothSnapshot(snapshot)
+            let stableID = normalizedAddress.map(Self.addressIdentifier) ?? existingDevice.idOr(fallbackID)
+
+            upsertDevice(
+                at: index,
+                stableID: stableID,
+                name: snapshot.name,
+                batteryPercent: snapshot.batteryPercent,
+                address: normalizedAddress,
+                peripheralIdentifier: existingDevice?.peripheralIdentifier,
+                source: .ioBluetooth,
+                isConnected: true,
+                now: now
+            )
+        }
+
+        for idx in devices.indices {
+            guard devices[idx].sources.contains(.ioBluetooth) else { continue }
+
+            let keepConnected: Bool
+            if let address = devices[idx].address {
+                keepConnected = seenAddresses.contains(address)
+            } else {
+                keepConnected = seenFallbackIDs.contains(devices[idx].id)
+            }
+
+            guard keepConnected == false else { continue }
+            devices[idx].sources.remove(.ioBluetooth)
+            devices[idx].isConnected = devices[idx].sources.contains(.ble)
+        }
+    }
+
+    mutating func applyBLEUpdate(_ update: BLEBatteryUpdate, now: Date) {
+        let index = indexForBLEUpdate(update)
+        let existingDevice = device(at: index)
+        let stableID = existingDevice?.id ?? Self.peripheralIdentifier(update.peripheralIdentifier)
+        let existingAddress = existingDevice?.address
+
+        upsertDevice(
+            at: index,
+            stableID: stableID,
+            name: update.name,
+            batteryPercent: update.batteryPercent,
+            address: existingAddress,
+            peripheralIdentifier: update.peripheralIdentifier,
+            source: .ble,
+            isConnected: update.isConnected,
+            now: now
+        )
+    }
+
+    private func device(at index: Int?) -> DeviceBatteryInfo? {
+        guard let index, devices.indices.contains(index) else { return nil }
+        return devices[index]
+    }
+
+    mutating func removeBLEPeripheral(_ peripheralIdentifier: UUID) {
+        guard let idx = devices.firstIndex(where: { $0.peripheralIdentifier == peripheralIdentifier }) else {
+            return
+        }
+
+        devices[idx].sources.remove(.ble)
+        devices[idx].peripheralIdentifier = nil
+        devices[idx].isConnected = devices[idx].sources.contains(.ioBluetooth)
+    }
+
+    mutating func enrichMissingBattery(from jsonData: Data, now: Date) {
+        for idx in devices.indices where devices[idx].isConnected && devices[idx].batteryPercent == nil {
+            let snapshot = SystemProfilerBluetoothReader.parseBattery(
+                jsonData: jsonData,
+                address: devices[idx].address,
+                deviceName: devices[idx].name
+            )
+
+            guard
+                let snapshot,
+                let batteryPercent = SystemProfilerBluetoothReader.displayBatteryPercent(from: snapshot)
+            else {
+                continue
+            }
+
+            devices[idx].batteryPercent = batteryPercent
+            devices[idx].lastUpdated = now
+        }
+    }
+
+    private mutating func upsertDevice(
+        at index: Int?,
+        stableID: String,
+        name: String,
+        batteryPercent: Int?,
+        address: String?,
+        peripheralIdentifier: UUID?,
+        source: DeviceDiscoverySource,
+        isConnected: Bool,
+        now: Date
+    ) {
+        let trimmedName = Self.trimmedName(name, fallback: "Audio device")
+
+        if let index {
+            devices[index].name = trimmedName
+            devices[index].sources.insert(source)
+            devices[index].isConnected = isConnected || !devices[index].sources.isEmpty
+            devices[index].lastUpdated = now
+
+            if let batteryPercent {
+                devices[index].batteryPercent = batteryPercent
+            }
+            if let address {
+                devices[index].address = address
+            }
+            if let peripheralIdentifier {
+                devices[index].peripheralIdentifier = peripheralIdentifier
+            }
+            return
+        }
+
+        devices.append(
+            DeviceBatteryInfo(
+                id: stableID,
+                name: trimmedName,
+                batteryPercent: batteryPercent,
+                lastUpdated: now,
+                isConnected: isConnected,
+                address: address,
+                peripheralIdentifier: peripheralIdentifier,
+                sources: source
+            )
+        )
+    }
+
+    private func indexForIOBluetoothSnapshot(_ snapshot: IOBluetoothAudioDeviceSnapshot) -> Int? {
+        if let address = Self.normalizedAddress(snapshot.address),
+           let byAddress = devices.firstIndex(where: { $0.address == address }) {
+            return byAddress
+        }
+
+        let normalizedName = Self.normalizedName(snapshot.name)
+        guard normalizedName.isEmpty == false else { return nil }
+
+        let nameMatches = devices.indices.filter {
+            Self.normalizedName(devices[$0].name) == normalizedName
+        }
+
+        return nameMatches.count == 1 ? nameMatches[0] : nil
+    }
+
+    private func indexForBLEUpdate(_ update: BLEBatteryUpdate) -> Int? {
+        if let byPeripheral = devices.firstIndex(where: { $0.peripheralIdentifier == update.peripheralIdentifier }) {
+            return byPeripheral
+        }
+
+        let normalizedName = Self.normalizedName(update.name)
+        guard normalizedName.isEmpty == false else { return nil }
+
+        let nameMatches = devices.indices.filter {
+            Self.normalizedName(devices[$0].name) == normalizedName
+        }
+
+        return nameMatches.count == 1 ? nameMatches[0] : nil
+    }
+
+    private static func trimmedName(_ name: String, fallback: String) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+
+    static func normalizedName(_ name: String) -> String {
+        trimmedName(name, fallback: "")
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+    }
+
+    private static func fallbackIdentifier(name: String) -> String {
+        "name:\(normalizedName(name))"
+    }
+
+    static func normalizedAddress(_ address: String?) -> String? {
+        guard let address else { return nil }
+        let normalized = address
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: ":")
+            .uppercased()
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private static func addressIdentifier(_ address: String) -> String {
+        "addr:\(address)"
+    }
+
+    private static func peripheralIdentifier(_ identifier: UUID) -> String {
+        "ble:\(identifier.uuidString)"
+    }
+}
+
+private extension Optional where Wrapped == DeviceBatteryInfo {
+    func idOr(_ fallback: String) -> String {
+        self?.id ?? fallback
+    }
 }
 
 @MainActor
 final class DevicesBatteryViewModel: NSObject, ObservableObject {
-    
+
     @Published private(set) var connectedDevices: [DeviceBatteryInfo] = []
     @Published private(set) var errorText: String?
-    
+
     var connectedHeadphones: [DeviceBatteryInfo] { connectedDevices }
-    
+
     private var central: CBCentralManager!
     private var peripherals: [UUID: CBPeripheral] = [:]
     private var batteryChars: [UUID: CBCharacteristic] = [:]
-    
-    // MARK: - IOBluetooth connection notifications (fix: app running -> headphones connect later)
-    
+    private var store = DeviceBatteryStore()
+
     private var connectNotification: IOBluetoothUserNotification?
-    private var disconnectNotifications: [String: IOBluetoothUserNotification] = [:] // key: addressString
-    
+    private var disconnectNotifications: [String: IOBluetoothUserNotification] = [:]
+
     private var refreshDebounceTask: Task<Void, Never>?
-    
+    private var refreshTask: Task<Void, Never>?
+    private var refreshGeneration = 0
+
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: nil)
     }
-    
+
     deinit {
+        refreshDebounceTask?.cancel()
+        refreshTask?.cancel()
+
         Task { @MainActor [weak self] in
             self?.stop()
         }
     }
-    
+
     func start() {
         setupIOBluetoothNotifications()
         refresh()
     }
-    
+
     func stop() {
-        // BLE cleanup
-        peripherals.values.forEach { p in
-            central.cancelPeripheralConnection(p)
+        refreshDebounceTask?.cancel()
+        refreshDebounceTask = nil
+        refreshTask?.cancel()
+        refreshTask = nil
+
+        peripherals.values.forEach { peripheral in
+            central.cancelPeripheralConnection(peripheral)
         }
         peripherals.removeAll()
         batteryChars.removeAll()
-        
-        // IOBluetooth notifications cleanup
+
         teardownIOBluetoothNotifications()
-        
-        // UI/state cleanup
-        refreshDebounceTask?.cancel()
-        refreshDebounceTask = nil
-        
+
+        store.clear()
         connectedDevices.removeAll()
         errorText = nil
     }
-    
+
     func refresh() {
-        Task { @MainActor in
-            errorText = nil
-            
-            // 1) Prefer IOBluetooth audio devices (fast + works for “connected audio” view)
-            await refreshIOBluetoothAudioDevices()
-            
-            // 2) Try to enrich nil battery values using system_profiler snapshot (AirPods often here)
-            await enrichWithSystemProfilerIfNeeded()
-            
-            // 3) Fallback BLE battery service
-            if central.state == .poweredOn {
-                let connected = central.retrieveConnectedPeripherals(
-                    withServices: [CBUUID(string: devicesBatteryServiceID)]
-                )
-                handleConnectedBLEPeripherals(connected)
+        refreshGeneration += 1
+        let generation = refreshGeneration
+
+        refreshTask?.cancel()
+        refreshTask = Task { [weak self] in
+            guard let self else { return }
+            await self.runRefresh(generation: generation)
+        }
+    }
+
+    private func runRefresh(generation: Int) async {
+        guard generation == refreshGeneration else { return }
+
+        errorText = nil
+        let now = Date()
+
+        store.applyIOBluetoothSnapshots(loadIOBluetoothDevices(), now: now)
+        syncConnectedDevices()
+
+        guard shouldContinueRefresh(generation) else { return }
+
+        if let json = await SystemProfilerBluetoothReader.fetchBluetoothJSON(),
+           shouldContinueRefresh(generation) {
+            store.enrichMissingBattery(from: json, now: Date())
+            syncConnectedDevices()
+        }
+
+        guard shouldContinueRefresh(generation) else { return }
+
+        if central.state == .poweredOn {
+            let connected = central.retrieveConnectedPeripherals(
+                withServices: [CBUUID(string: devicesBatteryServiceID)]
+            )
+            mergeBLEPeripherals(connected)
+        }
+
+        syncConnectedDevices()
+    }
+
+    private func shouldContinueRefresh(_ generation: Int) -> Bool {
+        Task.isCancelled == false && generation == refreshGeneration
+    }
+
+    private func syncConnectedDevices() {
+        connectedDevices = store.connectedDevices
+    }
+
+    private func mergeBLEPeripherals(_ connected: [CBPeripheral]) {
+        for peripheral in connected {
+            peripherals[peripheral.identifier] = peripheral
+            peripheral.delegate = self
+
+            let update = BLEBatteryUpdate(
+                name: peripheral.name ?? "BLE device",
+                peripheralIdentifier: peripheral.identifier,
+                batteryPercent: nil,
+                isConnected: true
+            )
+            store.applyBLEUpdate(update, now: Date())
+
+            if peripheral.state != .connected {
+                central.connect(peripheral, options: nil)
+            } else {
+                peripheral.discoverServices([CBUUID(string: devicesBatteryServiceID)])
             }
         }
     }
-    
-    // MARK: - IOBluetooth notifications
-    
+
     private func setupIOBluetoothNotifications() {
         guard connectNotification == nil else { return }
-        
-        // Fires when *any* BT device connects
+
         connectNotification = IOBluetoothDevice.register(
             forConnectNotifications: self,
             selector: #selector(iobtDeviceConnected(_:device:))
         )
-        
-        // Also register disconnect notifications for devices already connected at app start.
+
         registerDisconnectForCurrentlyConnectedAudioDevices()
     }
-    
+
     private func teardownIOBluetoothNotifications() {
         connectNotification?.unregister()
         connectNotification = nil
-        
-        for (_, n) in disconnectNotifications {
-            n.unregister()
+
+        for notification in disconnectNotifications.values {
+            notification.unregister()
         }
         disconnectNotifications.removeAll()
     }
-    
+
     private func registerDisconnect(for device: IOBluetoothDevice) {
-        guard let addr = device.addressString, disconnectNotifications[addr] == nil else { return }
-        
-        // Fires when *this specific* device disconnects
-        let notif = device.register(
+        guard
+            let address = DeviceBatteryStore.normalizedAddress(device.addressString),
+            disconnectNotifications[address] == nil
+        else {
+            return
+        }
+
+        let notification = device.register(
             forDisconnectNotification: self,
             selector: #selector(iobtDeviceDisconnected(_:device:))
         )
-        
-        if let notif {
-            disconnectNotifications[addr] = notif
+
+        if let notification {
+            disconnectNotifications[address] = notification
         }
     }
-    
+
     private func registerDisconnectForCurrentlyConnectedAudioDevices() {
-        // We only care about audio-ish devices to avoid registering for everything.
-        let audioDevices = getAllIOBluetoothAudioDevices()
-        for d in audioDevices where d.isConnected() {
-            registerDisconnect(for: d)
+        for device in getAllIOBluetoothAudioDevices() where device.isConnected() {
+            registerDisconnect(for: device)
         }
     }
-    
+
     private func scheduleRefresh(delay: TimeInterval = 0.35) {
         refreshDebounceTask?.cancel()
         refreshDebounceTask = Task { [weak self] in
             guard let self else { return }
-            let ns = UInt64(delay * 1_000_000_000)
-            try? await Task.sleep(nanoseconds: ns)
+            let nanoseconds = UInt64(delay * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard Task.isCancelled == false else { return }
             await MainActor.run {
                 self.refresh()
             }
         }
     }
-    
+
     @objc private func iobtDeviceConnected(_ notification: IOBluetoothUserNotification, device: IOBluetoothDevice) {
-        // Register disconnect for this device too.
         registerDisconnect(for: device)
         scheduleRefresh()
     }
-    
+
     @objc private func iobtDeviceDisconnected(_ notification: IOBluetoothUserNotification, device: IOBluetoothDevice) {
-        if let addr = device.addressString, let n = disconnectNotifications[addr] {
-            n.unregister()
-            disconnectNotifications.removeValue(forKey: addr)
+        if let address = DeviceBatteryStore.normalizedAddress(device.addressString),
+           let notification = disconnectNotifications[address] {
+            notification.unregister()
+            disconnectNotifications.removeValue(forKey: address)
         }
         scheduleRefresh()
     }
-    
-    // MARK: - system_profiler enrichment
-    
-    private func enrichWithSystemProfilerIfNeeded() async {
-        guard let json = await SystemProfilerBluetoothReader.fetchBluetoothJSON() else { return }
 
-        for idx in connectedDevices.indices {
-            let hp = connectedDevices[idx]
-            if hp.batteryPercent != nil { continue }
-            
-            let addr = hp.id
-                .replacingOccurrences(of: "-", with: ":")
-                .uppercased()
-            
-            let snap = SystemProfilerBluetoothReader.parseBattery(
-                jsonData: json,
-                address: addr,
-                deviceName: hp.name
-            )
-
-            guard let snap else { continue }
-            
-            let newPercent: Int? = {
-                if let l = snap.left, snap.right == nil, snap.casePct == nil {
-                    return l
-                }
-                let vals = [snap.left, snap.right, snap.casePct].compactMap { $0 }
-                guard !vals.isEmpty else { return nil }
-                return Int(round(Double(vals.reduce(0, +)) / Double(vals.count)))
-            }()
-            
-            guard let newPercent else { continue }
-            
-            connectedDevices[idx].batteryPercent = newPercent
-            connectedDevices[idx].lastUpdated = Date()
-        }
-    }
-    
-    // MARK: - Audio filtering
-    
     private func isLikelyHeadphonesName(_ name: String) -> Bool {
-        let n = name.lowercased()
-        
-        // hard excludes
-        if n.contains("keyboard") || n.contains("mouse") || n.contains("trackpad") { return false }
-        if n.contains("magic keyboard") || n.contains("magic mouse") || n.contains("logitech") { return false }
-        if n.contains("mx keys") || n.contains("mx master") { return false }
-        
-        // includes
-        if n.contains("airpods") { return true }
-        if n.contains("beats") { return true }
-        if n.contains("headphone") || n.contains("headphones") { return true }
-        if n.contains("buds") || n.contains("earbuds") { return true }
-        if n.contains("ear") && n.contains("pod") { return true }
-        
+        let normalized = name.lowercased()
+
+        if normalized.contains("keyboard") || normalized.contains("mouse") || normalized.contains("trackpad") {
+            return false
+        }
+        if normalized.contains("magic keyboard") || normalized.contains("magic mouse") || normalized.contains("logitech") {
+            return false
+        }
+        if normalized.contains("mx keys") || normalized.contains("mx master") {
+            return false
+        }
+
+        if normalized.contains("airpods") { return true }
+        if normalized.contains("beats") { return true }
+        if normalized.contains("headphone") || normalized.contains("headphones") { return true }
+        if normalized.contains("buds") || normalized.contains("earbuds") { return true }
+        if normalized.contains("ear") && normalized.contains("pod") { return true }
+
         return false
     }
-    
+
     private func getAllIOBluetoothAudioDevices() -> [IOBluetoothDevice] {
         let paired = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] ?? []
         return paired.filter { device in
@@ -224,62 +492,15 @@ final class DevicesBatteryViewModel: NSObject, ObservableObject {
             return isLikelyHeadphonesName(name)
         }
     }
-    
-    private func refreshIOBluetoothAudioDevices() async {
-        let audio = getAllIOBluetoothAudioDevices()
-        
-        // mark all existing as disconnected; we'll flip to true for those still connected
-        for idx in connectedDevices.indices {
-            connectedDevices[idx].isConnected = false
-        }
-        
-        for d in audio {
-            let name = (d.name ?? "Audio device").trimmingCharacters(in: .whitespacesAndNewlines)
-            let id = d.addressString ?? "iobt-\(name)"
-            
-            guard d.isConnected() else { continue }
-            
-            // ensure we have disconnect notification for currently connected device
-            registerDisconnect(for: d)
-            
-            if let idx = connectedDevices.firstIndex(where: { $0.id == id }) {
-                // UPDATE існуючий — НЕ затираємо batteryPercent
-                connectedDevices[idx].name = name
-                connectedDevices[idx].isConnected = true
-                connectedDevices[idx].lastUpdated = Date()
-                
-                // If we can get battery from IOBluetooth KVC - set it
-                if let p = d.bd_batteryPercent {
-                    connectedDevices[idx].batteryPercent = p
-                }
-            } else {
-                connectedDevices.append(
-                    DeviceBatteryInfo(
-                        id: id,
-                        name: name,
-                        batteryPercent: d.bd_batteryPercent,
-                        lastUpdated: Date(),
-                        isConnected: true
-                    )
-                )
-            }
-        }
-        
-        // remove devices that are not connected anymore (optional; can keep but hide in UI)
-        connectedDevices.removeAll { !$0.isConnected }
-    }
-    
-    // MARK: - BLE (fallback)
-    
-    private func handleConnectedBLEPeripherals(_ connected: [CBPeripheral]) {
-        for p in connected {
-            peripherals[p.identifier] = p
-            p.delegate = self
-            if p.state != .connected {
-                central.connect(p, options: nil)
-            } else {
-                p.discoverServices([CBUUID(string: devicesBatteryServiceID)])
-            }
+
+    private func loadIOBluetoothDevices() -> [IOBluetoothAudioDeviceSnapshot] {
+        getAllIOBluetoothAudioDevices().map { device in
+            IOBluetoothAudioDeviceSnapshot(
+                name: device.name ?? "Audio device",
+                address: DeviceBatteryStore.normalizedAddress(device.addressString),
+                batteryPercent: device.bd_batteryPercent,
+                isConnected: device.isConnected()
+            )
         }
     }
 }
@@ -290,34 +511,34 @@ extension DevicesBatteryViewModel: CBCentralManagerDelegate {
     nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
         Task { @MainActor in
             if central.state == .poweredOn {
-                // Do a passive refresh (retrieve connected peripherals)
-                let connected = central.retrieveConnectedPeripherals(
-                    withServices: [CBUUID(string: devicesBatteryServiceID)]
-                )
-                handleConnectedBLEPeripherals(connected)
+                refresh()
             }
         }
     }
-    
-    nonisolated func centralManager(_ central: CBCentralManager,
-                                    didDiscover peripheral: CBPeripheral,
-                                    advertisementData: [String : Any],
-                                    rssi RSSI: NSNumber) {
-        // not used (we don't actively scan)
+
+    nonisolated func centralManager(
+        _ central: CBCentralManager,
+        didDiscover peripheral: CBPeripheral,
+        advertisementData: [String : Any],
+        rssi RSSI: NSNumber
+    ) {
+        // not used
     }
-    
+
     nonisolated func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         peripheral.discoverServices([CBUUID(string: devicesBatteryServiceID)])
     }
-    
+
     nonisolated func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         // ignore
     }
-    
+
     nonisolated func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         Task { @MainActor in
             peripherals.removeValue(forKey: peripheral.identifier)
             batteryChars.removeValue(forKey: peripheral.identifier)
+            store.removeBLEPeripheral(peripheral.identifier)
+            syncConnectedDevices()
         }
     }
 }
@@ -328,62 +549,53 @@ extension DevicesBatteryViewModel: CBPeripheralDelegate {
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard error == nil else { return }
         guard let services = peripheral.services else { return }
-        
-        let batteryService = CBUUID(string: devicesBatteryServiceID)
-        let batteryLevelChar = CBUUID(string: devicesBatteryLevelCharacteristicID)
 
-        for s in services where s.uuid == batteryService {
-            peripheral.discoverCharacteristics([batteryLevelChar], for: s)
+        let batteryService = CBUUID(string: devicesBatteryServiceID)
+        let batteryLevelCharacteristic = CBUUID(string: devicesBatteryLevelCharacteristicID)
+
+        for service in services where service.uuid == batteryService {
+            peripheral.discoverCharacteristics([batteryLevelCharacteristic], for: service)
         }
     }
-    
-    nonisolated func peripheral(_ peripheral: CBPeripheral,
-                                didDiscoverCharacteristicsFor service: CBService,
-                                error: Error?) {
+
+    nonisolated func peripheral(
+        _ peripheral: CBPeripheral,
+        didDiscoverCharacteristicsFor service: CBService,
+        error: Error?
+    ) {
         guard error == nil else { return }
-        
+
         Task { @MainActor in
-            guard let chars = service.characteristics else { return }
-            let batteryLevelChar = CBUUID(string: devicesBatteryLevelCharacteristicID)
-            
-            for c in chars where c.uuid == batteryLevelChar {
-                self.batteryChars[peripheral.identifier] = c
-                peripheral.readValue(for: c)
-                peripheral.setNotifyValue(true, for: c)
+            guard let characteristics = service.characteristics else { return }
+            let batteryLevelCharacteristic = CBUUID(string: devicesBatteryLevelCharacteristicID)
+
+            for characteristic in characteristics where characteristic.uuid == batteryLevelCharacteristic {
+                batteryChars[peripheral.identifier] = characteristic
+                peripheral.readValue(for: characteristic)
+                peripheral.setNotifyValue(true, for: characteristic)
             }
         }
     }
-    
-    nonisolated func peripheral(_ peripheral: CBPeripheral,
-                                didUpdateValueFor characteristic: CBCharacteristic,
-                                error: Error?) {
+
+    nonisolated func peripheral(
+        _ peripheral: CBPeripheral,
+        didUpdateValueFor characteristic: CBCharacteristic,
+        error: Error?
+    ) {
         guard error == nil else { return }
-        let batteryLevelChar = CBUUID(string: devicesBatteryLevelCharacteristicID)
-        guard characteristic.uuid == batteryLevelChar else { return }
-        guard let data = characteristic.value, data.count >= 1 else { return }
-        
-        let percent = Int(data.first!)
-        
+        let batteryLevelCharacteristic = CBUUID(string: devicesBatteryLevelCharacteristicID)
+        guard characteristic.uuid == batteryLevelCharacteristic else { return }
+        guard let data = characteristic.value, let firstByte = data.first else { return }
+
         Task { @MainActor in
-            let name = (peripheral.name ?? "BLE device").trimmingCharacters(in: .whitespacesAndNewlines)
-            let id = peripheral.identifier.uuidString
-            
-            if let idx = connectedDevices.firstIndex(where: { $0.id == id }) {
-                connectedDevices[idx].name = name
-                connectedDevices[idx].batteryPercent = percent
-                connectedDevices[idx].lastUpdated = Date()
-                connectedDevices[idx].isConnected = true
-            } else {
-                connectedDevices.append(
-                    DeviceBatteryInfo(
-                        id: id,
-                        name: name,
-                        batteryPercent: percent,
-                        lastUpdated: Date(),
-                        isConnected: true
-                    )
-                )
-            }
+            let update = BLEBatteryUpdate(
+                name: peripheral.name ?? "BLE device",
+                peripheralIdentifier: peripheral.identifier,
+                batteryPercent: Int(firstByte),
+                isConnected: true
+            )
+            store.applyBLEUpdate(update, now: Date())
+            syncConnectedDevices()
         }
     }
 }
@@ -392,8 +604,8 @@ extension DevicesBatteryViewModel: CBPeripheralDelegate {
 
 private extension IOBluetoothDevice {
     var bd_batteryPercent: Int? {
-        guard self.responds(to: Selector(("batteryPercent"))) else { return nil }
-        
+        guard responds(to: Selector(("batteryPercent"))) else { return nil }
+
         return ObjC.catchException {
             (self.value(forKey: "batteryPercent") as? NSNumber)?.intValue
         }

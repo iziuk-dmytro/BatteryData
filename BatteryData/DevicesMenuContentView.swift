@@ -3,6 +3,13 @@ import SwiftUI
 struct DevicesMenuContentView: View {
     @ObservedObject var vm: DevicesBatteryViewModel
 
+    private static let updatedAtFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        formatter.dateStyle = .none
+        return formatter
+    }()
+
     private func percentText(_ p: Int?) -> String {
         guard let p else { return "—" }
         return "\(p)%"
@@ -10,10 +17,7 @@ struct DevicesMenuContentView: View {
 
     private func timeText(_ d: Date?) -> String {
         guard let d else { return "—" }
-        let f = DateFormatter()
-        f.timeStyle = .short
-        f.dateStyle = .none
-        return f.string(from: d)
+        return Self.updatedAtFormatter.string(from: d)
     }
 
     var body: some View {

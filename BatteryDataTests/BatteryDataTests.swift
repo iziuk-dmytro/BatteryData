@@ -93,6 +93,93 @@ struct BatteryDataTests {
 
         #expect(result == nil)
     }
+
+    @Test func displayBatteryPercentAveragesAvailableComponentReadings() throws {
+        let snapshot = AirPodsBatterySnapshot(device: nil, left: 94, right: 91, casePct: 67)
+
+        let result = SystemProfilerBluetoothReader.displayBatteryPercent(from: snapshot)
+
+        #expect(result == 84)
+    }
+
+    @Test func displayBatteryPercentUsesSingleAvailableReading() throws {
+        let snapshot = AirPodsBatterySnapshot(device: nil, left: 88, right: nil, casePct: nil)
+
+        let result = SystemProfilerBluetoothReader.displayBatteryPercent(from: snapshot)
+
+        #expect(result == 88)
+    }
+
+    @Test func deviceBatteryStoreMergesIOBluetoothAndBLEIntoSingleDevice() throws {
+        var store = DeviceBatteryStore()
+        let now = Date(timeIntervalSince1970: 10_000)
+        let peripheralID = UUID()
+
+        store.applyIOBluetoothSnapshots(
+            [
+                IOBluetoothAudioDeviceSnapshot(
+                    name: "AirPods Pro",
+                    address: "AA-BB-CC-DD-EE-FF",
+                    batteryPercent: nil,
+                    isConnected: true
+                )
+            ],
+            now: now
+        )
+
+        store.applyBLEUpdate(
+            BLEBatteryUpdate(
+                name: "AirPods Pro",
+                peripheralIdentifier: peripheralID,
+                batteryPercent: 92,
+                isConnected: true
+            ),
+            now: now.addingTimeInterval(1)
+        )
+
+        #expect(store.connectedDevices.count == 1)
+        #expect(store.connectedDevices.first?.id == "addr:AA:BB:CC:DD:EE:FF")
+        #expect(store.connectedDevices.first?.peripheralIdentifier == peripheralID)
+        #expect(store.connectedDevices.first?.batteryPercent == 92)
+    }
+
+    @Test func deviceBatteryStoreAvoidsDuplicatesOnRepeatedRefreshes() throws {
+        var store = DeviceBatteryStore()
+        let now = Date(timeIntervalSince1970: 11_000)
+        let snapshot = IOBluetoothAudioDeviceSnapshot(
+            name: "Beats Studio Pro",
+            address: "11:22:33:44:55:66",
+            batteryPercent: 75,
+            isConnected: true
+        )
+
+        store.applyIOBluetoothSnapshots([snapshot], now: now)
+        store.applyIOBluetoothSnapshots([snapshot], now: now.addingTimeInterval(5))
+
+        #expect(store.connectedDevices.count == 1)
+        #expect(store.connectedDevices.first?.batteryPercent == 75)
+    }
+
+    @Test func deviceBatteryStoreKeepsBLEOnlyDeviceDuringIOBluetoothRefresh() throws {
+        var store = DeviceBatteryStore()
+        let now = Date(timeIntervalSince1970: 12_000)
+
+        store.applyBLEUpdate(
+            BLEBatteryUpdate(
+                name: "Beats Solo Buds",
+                peripheralIdentifier: UUID(),
+                batteryPercent: 64,
+                isConnected: true
+            ),
+            now: now
+        )
+
+        store.applyIOBluetoothSnapshots([], now: now.addingTimeInterval(2))
+
+        #expect(store.connectedDevices.count == 1)
+        #expect(store.connectedDevices.first?.name == "Beats Solo Buds")
+        #expect(store.connectedDevices.first?.batteryPercent == 64)
+    }
     
     @Test func batteryViewModelUsesFallbackEtaFromPercentageTrend() throws {
         var samples = [

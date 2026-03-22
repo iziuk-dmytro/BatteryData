@@ -23,10 +23,8 @@ enum SystemProfilerBluetoothReader {
         await withCheckedContinuation { cont in
             DispatchQueue.global(qos: .utility).async {
                 let p = Process()
-
-                // ⛔️ ВАЖЛИВО: через shell
-                p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-                p.arguments = ["-lc", "/usr/sbin/system_profiler SPBluetoothDataType -json"]
+                p.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
+                p.arguments = ["SPBluetoothDataType", "-json"]
 
                 let out = Pipe()
                 let err = Pipe()
@@ -129,6 +127,22 @@ enum SystemProfilerBluetoothReader {
         }
 
         return nil
+    }
+
+    static func displayBatteryPercent(from snapshot: AirPodsBatterySnapshot) -> Int? {
+        if let device = snapshot.device {
+            return device
+        }
+
+        let values = [snapshot.left, snapshot.right, snapshot.casePct].compactMap { $0 }
+        guard values.isEmpty == false else { return nil }
+
+        if values.count == 1 {
+            return values[0]
+        }
+
+        let average = Double(values.reduce(0, +)) / Double(values.count)
+        return Int(average.rounded())
     }
 
     // MARK: - TEXT (fallback, not reliable for AirPods)
