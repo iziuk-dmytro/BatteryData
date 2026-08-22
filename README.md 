@@ -52,6 +52,7 @@ Charts are shown inside a popover window and update automatically.
 - Estimation window for ETA calculation
 - History chart duration
 - Expanded battery info in status bar
+- Optional power value in expanded status
 - Launch at login
 - Notification preferences (via macOS System Settings)
 
@@ -59,7 +60,7 @@ Charts are shown inside a popover window and update automatically.
 
 ## 🖥 Requirements
 
-- macOS 13.0 or newer
+- macOS 15.0 or newer
 - Apple Silicon or Intel Mac
 
 ---

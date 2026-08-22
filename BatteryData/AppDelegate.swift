@@ -7,6 +7,7 @@
 
 import AppKit
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let vm = BatteryViewModel()
     private var statusBar: StatusBarController?

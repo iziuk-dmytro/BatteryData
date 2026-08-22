@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import Darwin
 
 struct AirPodsBatterySnapshot: Equatable {
     var device: Int?
@@ -16,41 +17,16 @@ struct AirPodsBatterySnapshot: Equatable {
 
 enum SystemProfilerBluetoothReader {
 
+    private static let processQueue = DispatchQueue(
+        label: "SystemProfilerBluetoothReader.process",
+        qos: .utility
+    )
+
     // MARK: - JSON (recommended for AirPods)
 
     /// Uses: /usr/sbin/system_profiler SPBluetoothDataType -json
     static func fetchBluetoothJSON() async -> Data? {
-        await withCheckedContinuation { cont in
-            DispatchQueue.global(qos: .utility).async {
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
-                p.arguments = ["SPBluetoothDataType", "-json"]
-
-                let out = Pipe()
-                let err = Pipe()
-                p.standardOutput = out
-                p.standardError = err
-
-                do {
-                    try p.run()
-                } catch {
-                    cont.resume(returning: nil)
-                    return
-                }
-
-                let outData = out.fileHandleForReading.readDataToEndOfFile()
-                _ = err.fileHandleForReading.readDataToEndOfFile()
-
-                p.waitUntilExit()
-
-                guard p.terminationStatus == 0, !outData.isEmpty else {
-                    cont.resume(returning: nil)
-                    return
-                }
-
-                cont.resume(returning: outData)
-            }
-        }
+        await runSystemProfiler(arguments: ["SPBluetoothDataType", "-json"])
     }
 
 
@@ -66,10 +42,7 @@ enum SystemProfilerBluetoothReader {
             let first = arr.first
         else { return nil }
 
-        let normalizedAddr = address?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "-", with: ":")
-            .uppercased()
+        let normalizedAddr = normalizedBluetoothAddress(address)
 
         let normalizedName = deviceName?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -95,9 +68,7 @@ enum SystemProfilerBluetoothReader {
                   let props = propsAny as? [String: Any]
             else { continue }
 
-            let addr = (props["device_address"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .uppercased()
+            let addr = normalizedBluetoothAddress(props["device_address"] as? String)
 
             let addrMatch = (normalizedAddr != nil && addr == normalizedAddr)
             let nameMatch = (normalizedName != nil && name.localizedCaseInsensitiveContains(normalizedName!))
@@ -134,14 +105,16 @@ enum SystemProfilerBluetoothReader {
             return device
         }
 
-        let values = [snapshot.left, snapshot.right, snapshot.casePct].compactMap { $0 }
-        guard values.isEmpty == false else { return nil }
-
-        if values.count == 1 {
-            return values[0]
+        let earbuds = [snapshot.left, snapshot.right].compactMap { $0 }
+        if earbuds.isEmpty {
+            return snapshot.casePct
         }
 
-        let average = Double(values.reduce(0, +)) / Double(values.count)
+        if earbuds.count == 1 {
+            return earbuds[0]
+        }
+
+        let average = Double(earbuds.reduce(0, +)) / Double(earbuds.count)
         return Int(average.rounded())
     }
 
@@ -149,32 +122,10 @@ enum SystemProfilerBluetoothReader {
 
     /// Uses: /usr/sbin/system_profiler SPBluetoothDataType
     static func fetchBluetoothText() async -> String? {
-        await withCheckedContinuation { cont in
-            DispatchQueue.global(qos: .utility).async {
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
-                p.arguments = ["SPBluetoothDataType"]
-
-                let pipe = Pipe()
-                p.standardOutput = pipe
-                p.standardError = pipe
-
-                do { try p.run() } catch {
-                    cont.resume(returning: nil)
-                    return
-                }
-
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                p.waitUntilExit()
-
-                guard p.terminationStatus == 0 else {
-                    cont.resume(returning: nil)
-                    return
-                }
-
-                cont.resume(returning: String(data: data, encoding: .utf8))
-            }
+        guard let data = await runSystemProfiler(arguments: ["SPBluetoothDataType"]) else {
+            return nil
         }
+        return String(data: data, encoding: .utf8)
     }
 
     /// Parse a device block by Bluetooth address, e.g. "A8:91:3D:0C:EB:EA"
@@ -249,5 +200,126 @@ enum SystemProfilerBluetoothReader {
             }
         }
         return nil
+    }
+
+    private static func normalizedBluetoothAddress(_ address: String?) -> String? {
+        guard let address else { return nil }
+        let normalized = address
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: ":")
+            .uppercased()
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private static func runSystemProfiler(arguments: [String]) async -> Data? {
+        let state = ProcessCancellationState()
+        let timeout = DispatchWorkItem {
+            state.cancel()
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 20, execute: timeout)
+
+        let result: Data? = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                processQueue.async {
+                    autoreleasepool {
+                        guard state.isCancelled == false else {
+                            continuation.resume(returning: nil)
+                            return
+                        }
+
+                        let process = Process()
+                        let output = Pipe()
+                        process.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
+                        process.arguments = arguments
+                        process.standardOutput = output
+                        process.standardError = FileHandle.nullDevice
+                        state.install(process)
+
+                        guard state.isCancelled == false else {
+                            state.clear(process)
+                            continuation.resume(returning: nil)
+                            return
+                        }
+
+                        do {
+                            try process.run()
+                        } catch {
+                            state.clear(process)
+                            continuation.resume(returning: nil)
+                            return
+                        }
+
+                        if state.isCancelled {
+                            process.terminate()
+                        }
+
+                        let data = output.fileHandleForReading.readDataToEndOfFile()
+                        process.waitUntilExit()
+                        state.clear(process)
+
+                        guard state.isCancelled == false,
+                              process.terminationStatus == 0,
+                              data.isEmpty == false else {
+                            continuation.resume(returning: nil)
+                            return
+                        }
+
+                        continuation.resume(returning: data)
+                    }
+                }
+            }
+        } onCancel: {
+            state.cancel()
+        }
+        timeout.cancel()
+        return result
+    }
+}
+
+private final class ProcessCancellationState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.withLock { cancelled }
+    }
+
+    func install(_ process: Process) {
+        lock.withLock {
+            self.process = process
+        }
+    }
+
+    func clear(_ process: Process) {
+        lock.withLock {
+            if self.process === process {
+                self.process = nil
+            }
+        }
+    }
+
+    func cancel() {
+        let runningProcess = lock.withLock { () -> Process? in
+            guard cancelled == false else { return nil }
+            cancelled = true
+            return process
+        }
+
+        guard let runningProcess, runningProcess.isRunning else { return }
+        runningProcess.terminate()
+
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.forceTerminate()
+        }
+    }
+
+    private func forceTerminate() {
+        let processIdentifier = lock.withLock { () -> Int32? in
+            guard let process, process.isRunning else { return nil }
+            return process.processIdentifier
+        }
+        guard let processIdentifier, processIdentifier > 0 else { return }
+        Darwin.kill(processIdentifier, SIGKILL)
     }
 }

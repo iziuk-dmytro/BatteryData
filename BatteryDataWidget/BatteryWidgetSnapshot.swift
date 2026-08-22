@@ -3,6 +3,8 @@ import IOKit
 import IOKit.ps
 
 struct BatteryWidgetSnapshot {
+    private static let sharedSnapshotMaxAge: TimeInterval = 10 * 60
+
     let percentage: Int?
     let isCharging: Bool
     let onACPower: Bool
@@ -30,38 +32,32 @@ struct BatteryWidgetSnapshot {
     )
 
     static func load(now: Date = .now) -> BatteryWidgetSnapshot {
-        if let shared = WidgetSnapshotSharedStore.load() {
-            return BatteryWidgetSnapshot(
-                percentage: shared.percentage,
-                isCharging: shared.isCharging ?? false,
-                onACPower: shared.onACPower ?? false,
-                timeToEmptyMin: shared.timeToEmptyMin,
-                timeToFullMin: shared.timeToFullMin,
-                watts: shared.watts,
-                currentCapacitymAh: shared.currentCapacitymAh,
-                maxCapacitymAh: shared.maxCapacitymAh,
-                designCapacitymAh: shared.designCapacitymAh,
-                cycleCount: shared.cycleCount,
-                updatedAt: shared.updatedAt
-            )
+        let shared = WidgetSnapshotSharedStore.load()
+        if let shared, isFresh(shared, now: now) {
+            return snapshot(from: shared)
         }
 
-        guard let info = BatteryWidgetReader.read(now: now) else {
-            return BatteryWidgetSnapshot(
-                percentage: nil,
-                isCharging: false,
-                onACPower: false,
-                timeToEmptyMin: nil,
-                timeToFullMin: nil,
-                watts: nil,
-                currentCapacitymAh: nil,
-                maxCapacitymAh: nil,
-                designCapacitymAh: nil,
-                cycleCount: nil,
-                updatedAt: now
-            )
+        if let liveSnapshot = BatteryWidgetReader.read(now: now) {
+            return liveSnapshot
         }
-        return info
+
+        if let shared {
+            return snapshot(from: shared)
+        }
+
+        return BatteryWidgetSnapshot(
+            percentage: nil,
+            isCharging: false,
+            onACPower: false,
+            timeToEmptyMin: nil,
+            timeToFullMin: nil,
+            watts: nil,
+            currentCapacitymAh: nil,
+            maxCapacitymAh: nil,
+            designCapacitymAh: nil,
+            cycleCount: nil,
+            updatedAt: now
+        )
     }
 
     var percentageText: String {
@@ -169,10 +165,28 @@ struct BatteryWidgetSnapshot {
     }
 
     private static func format(mAh: Int) -> String {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        formatter.groupingSeparator = " "
-        return (formatter.string(from: NSNumber(value: mAh)) ?? "\(mAh)") + " mAh"
+        mAh.formatted(.number.grouping(.automatic)) + " mAh"
+    }
+
+    private static func isFresh(_ payload: WidgetSnapshotSharedStore.Payload, now: Date) -> Bool {
+        let age = now.timeIntervalSince(payload.updatedAt)
+        return age >= -60 && age <= sharedSnapshotMaxAge
+    }
+
+    private static func snapshot(from payload: WidgetSnapshotSharedStore.Payload) -> BatteryWidgetSnapshot {
+        BatteryWidgetSnapshot(
+            percentage: payload.percentage,
+            isCharging: payload.isCharging ?? false,
+            onACPower: payload.onACPower ?? false,
+            timeToEmptyMin: payload.timeToEmptyMin,
+            timeToFullMin: payload.timeToFullMin,
+            watts: payload.watts,
+            currentCapacitymAh: payload.currentCapacitymAh,
+            maxCapacitymAh: payload.maxCapacitymAh,
+            designCapacitymAh: payload.designCapacitymAh,
+            cycleCount: payload.cycleCount,
+            updatedAt: payload.updatedAt
+        )
     }
 }
 

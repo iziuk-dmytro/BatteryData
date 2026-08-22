@@ -15,9 +15,9 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "1E1AD4F02E73250C00F2C143"
-               BuildableName = "BatteryData.app"
-               BlueprintName = "BatteryData"
+               BlueprintIdentifier = "8B1C2D3E4F5061728394A004"
+               BuildableName = "BatteryDataiOS.app"
+               BlueprintName = "BatteryDataiOS"
                ReferencedContainer = "container:BatteryData.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
@@ -29,30 +29,6 @@
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
       shouldUseLaunchSchemeArgsEnv = "YES"
       shouldAutocreateTestPlan = "YES">
-      <Testables>
-         <TestableReference
-            skipped = "NO"
-            parallelizable = "YES">
-            <BuildableReference
-               BuildableIdentifier = "primary"
-               BlueprintIdentifier = "1E1AD4FE2E73250E00F2C143"
-               BuildableName = "BateryDataTests.xctest"
-               BlueprintName = "BateryDataTests"
-               ReferencedContainer = "container:BatteryData.xcodeproj">
-            </BuildableReference>
-         </TestableReference>
-         <TestableReference
-            skipped = "NO"
-            parallelizable = "YES">
-            <BuildableReference
-               BuildableIdentifier = "primary"
-               BlueprintIdentifier = "1E1AD5082E73250E00F2C143"
-               BuildableName = "BateryDataUITests.xctest"
-               BlueprintName = "BateryDataUITests"
-               ReferencedContainer = "container:BatteryData.xcodeproj">
-            </BuildableReference>
-         </TestableReference>
-      </Testables>
    </TestAction>
    <LaunchAction
       buildConfiguration = "Debug"
@@ -68,9 +44,9 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "1E1AD4F02E73250C00F2C143"
-            BuildableName = "BatteryData.app"
-            BlueprintName = "BatteryData"
+            BlueprintIdentifier = "8B1C2D3E4F5061728394A004"
+            BuildableName = "BatteryDataiOS.app"
+            BlueprintName = "BatteryDataiOS"
             ReferencedContainer = "container:BatteryData.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
@@ -85,9 +61,9 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "1E1AD4F02E73250C00F2C143"
-            BuildableName = "BatteryData.app"
-            BlueprintName = "BatteryData"
+            BlueprintIdentifier = "8B1C2D3E4F5061728394A004"
+            BuildableName = "BatteryDataiOS.app"
+            BlueprintName = "BatteryDataiOS"
             ReferencedContainer = "container:BatteryData.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>

@@ -19,8 +19,13 @@ enum WidgetSnapshotSharedStore {
     }
 
     static func load() -> Payload? {
-        guard let fileURL = sharedFileURL(),
-              let data = try? Data(contentsOf: fileURL) else { return nil }
+        guard let fileURL = sharedFileURL() else { return nil }
+        if let resourceValues = try? fileURL.resourceValues(forKeys: [.fileSizeKey]),
+           let fileSize = resourceValues.fileSize,
+           fileSize > 64 * 1024 {
+            return nil
+        }
+        guard let data = try? Data(contentsOf: fileURL) else { return nil }
         return try? JSONDecoder().decode(Payload.self, from: data)
     }
 

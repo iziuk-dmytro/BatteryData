@@ -11,6 +11,7 @@ import Combine
 import WidgetKit
 #endif
 
+@MainActor
 final class BatteryViewModel: ObservableObject {
     @Published private(set) var info = BatteryInfo.empty
     @Published private(set) var usedFallbackEstimate = false
@@ -25,14 +26,23 @@ final class BatteryViewModel: ObservableObject {
     private var fullNotified = false
     private var lastSpikeAt: Date?
     private var lastWidgetReloadAt: Date?
+    private var lastWidgetSnapshotSaveAt: Date?
     private var lastWidgetReloadSignature: WidgetReloadSignature?
     
     // Prefs
-    private var refreshIntervalSec: TimeInterval { UserDefaults.standard.double(forKey: PrefKeys.refreshIntervalSec) }
-    private var estimationWindowSec: TimeInterval { UserDefaults.standard.double(forKey: PrefKeys.estimationWindowMin) * 60.0 }
-    private var chartDurationSec: TimeInterval { UserDefaults.standard.double(forKey: PrefKeys.chartDurationMin) * 60.0 }
-    //    private var showWattsInStatusBar: Bool { UserDefaults.standard.bool(forKey: PrefKeys.showWattsInStatusBar) }
-    private var compactLabel: Bool { UserDefaults.standard.bool(forKey: PrefKeys.compactLabel) }
+    private let defaults: UserDefaults
+    private var refreshIntervalSec: TimeInterval {
+        positivePreference(PrefKeys.refreshIntervalSec, fallback: 1)
+    }
+    private var estimationWindowSec: TimeInterval {
+        positivePreference(PrefKeys.estimationWindowMin, fallback: 3) * 60
+    }
+    private var chartDurationSec: TimeInterval {
+        positivePreference(PrefKeys.chartDurationMin, fallback: 60) * 60
+    }
+    private var showWattsInStatusBar: Bool {
+        (defaults.object(forKey: PrefKeys.showWattsInStatusBar) as? NSNumber)?.boolValue ?? true
+    }
     
     // AC deficit: adapter doesn't cover load → battery discharges
     private var exactAdapterDeficit: Bool { info.onACPower == true && (info.watts ?? 0) < 0 }
@@ -53,29 +63,32 @@ final class BatteryViewModel: ObservableObject {
     
     init(
         autoStart: Bool = true,
+        defaults: UserDefaults = .standard,
         readBatteryInfo: @escaping () -> BatteryInfo? = { BatteryReader.read() },
         notify: @escaping (String, String) -> Void = { title, body in
             Notifier.notify(title: title, body: body)
         },
         now: @escaping () -> Date = Date.init
     ) {
+        self.defaults = defaults
         self.readBatteryInfo = readBatteryInfo
         self.notify = notify
         self.now = now
         
         defaultsObserver = NotificationCenter.default.addObserver(
-            forName: UserDefaults.didChangeNotification, object: nil, queue: .main
+            forName: UserDefaults.didChangeNotification, object: defaults, queue: .main
         ) { [weak self] _ in
-            self?.restartTimerIfNeeded()
-            self?.objectWillChange.send()
+            Task { @MainActor [weak self] in
+                self?.restartTimerIfNeeded()
+                self?.objectWillChange.send()
+            }
         }
         if autoStart {
-            refresh()
             startAutoRefresh()
         }
     }
     
-    deinit {
+    isolated deinit {
         if let obs = defaultsObserver { NotificationCenter.default.removeObserver(obs) }
         timer?.cancel()
     }
@@ -88,6 +101,12 @@ final class BatteryViewModel: ObservableObject {
         // 0.5…3600 сек — запобігаємо 0
         let v = refreshIntervalSec
         return min(max(v, 0.5), 3600)
+    }
+
+    private func positivePreference(_ key: String, fallback: Double) -> Double {
+        guard defaults.object(forKey: key) != nil else { return fallback }
+        let value = defaults.double(forKey: key)
+        return value.isFinite && value > 0 ? value : fallback
     }
     
     func startAutoRefresh() {
@@ -103,9 +122,6 @@ final class BatteryViewModel: ObservableObject {
         let newInt = clampedRefreshInterval()
         if abs(newInt - lastInterval) > 0.001 {
             startAutoRefresh()
-        } else {
-            // якщо змінювались не інтервали, а інші prefs — все одно перерахуй
-            refresh()
         }
     }
     
@@ -144,13 +160,13 @@ final class BatteryViewModel: ObservableObject {
         //        let bolt = (info.isCharging == true) ? " ⚡︎" : ""
         let warn = adapterDeficit ? " ⚠︎" : ""
         let eta   = currentETAString(prefixApprox: true)
-        let watts = shortWatts(info.watts)
+        let watts = showWattsInStatusBar ? shortWatts(info.watts) : nil
         
         switch (eta, watts) {
         case let (e?, w?): return " \(pct) · \(e) · \(w)\(warn)"
         case let (e?, nil): return " \(pct) · \(e)\(warn)"
         case let (nil, w?): return " \(pct) · \(w)\(warn)"
-        default:            return " \(pct) · \(warn)"
+        default:            return " \(pct)\(warn)"
         }
     }
     
@@ -169,14 +185,12 @@ final class BatteryViewModel: ObservableObject {
     // MARK: - Refresh & ETA
     
     func refresh() {
-        let previousInfo = info
-        let previousFallback = usedFallbackEstimate
         let currentTime = now()
         usedFallbackEstimate = false
         let newInfo = readBatteryInfo() ?? .empty
         info = newInfo
         
-        appendHistory(info: newInfo)
+        appendHistory(info: newInfo, at: currentTime)
         
         if let p = newInfo.percentage {
             samplesForEta.append((currentTime, p))
@@ -215,9 +229,9 @@ final class BatteryViewModel: ObservableObject {
             }
         }
         
-        WidgetSnapshotStore.save(info: info, updatedAt: currentTime)
-        handleNotifications(old: newInfo)
-        reloadWidgetIfNeeded(previousInfo: previousInfo, previousFallback: previousFallback)
+        persistWidgetSnapshotIfNeeded(at: currentTime)
+        handleNotifications(info: newInfo, at: currentTime)
+        reloadWidgetIfNeeded(at: currentTime)
     }
     
     private func estimateMinutesLeftFromSamples(windowSec: TimeInterval) -> Int? {
@@ -235,8 +249,7 @@ final class BatteryViewModel: ObservableObject {
         return minutesLeft.isFinite && minutesLeft > 0 ? Int(minutesLeft.rounded()) : nil
     }
     
-    private func appendHistory(info: BatteryInfo) {
-        let currentTime = now()
+    private func appendHistory(info: BatteryInfo, at currentTime: Date) {
         history.append(HistorySample(t: currentTime, percent: info.percentage, watts: info.watts))
         let cutoff = currentTime.addingTimeInterval(-chartDurationSec)
         history.removeAll { $0.t < cutoff }
@@ -244,8 +257,7 @@ final class BatteryViewModel: ObservableObject {
     
     // MARK: - Notifications
     
-    private func handleNotifications(old newInfo: BatteryInfo) {
-        let currentTime = now()
+    private func handleNotifications(info newInfo: BatteryInfo, at currentTime: Date) {
         
         // Low battery 20/10/5 — тільки на батареї
         if newInfo.onACPower == false, let p = newInfo.percentage {
@@ -272,12 +284,13 @@ final class BatteryViewModel: ObservableObject {
         // Стрибки потужності: |ΔW| > 10 Вт за < 10 c, cooldown 5 хв
         if let wNow = newInfo.watts {
             let tenSecAgo = currentTime.addingTimeInterval(-10)
-            if let wPast = history.last(where: { $0.t <= tenSecAgo })?.watts,
-               abs(wNow - (wPast ?? 0)) >= 10 {
+            if let pastSample = history.last(where: { $0.t <= tenSecAgo }),
+               let wPast = pastSample.watts,
+               abs(wNow - wPast) >= 10 {
                 if lastSpikeAt == nil || currentTime.timeIntervalSince(lastSpikeAt!) > 300 {
                     let sign = wNow >= 0 ? "+" : "−"
                     notify("Power Spike",
-                           "Power changed by \(sign)\(String(format: "%.1f", abs(wNow - (wPast ?? 0))))W")
+                           "Power changed by \(sign)\(String(format: "%.1f", abs(wNow - wPast)))W")
                     lastSpikeAt = currentTime
                 }
             }
@@ -304,17 +317,24 @@ final class BatteryViewModel: ObservableObject {
         }
     }
 
-    private func reloadWidgetIfNeeded(previousInfo: BatteryInfo, previousFallback: Bool) {
+    private func persistWidgetSnapshotIfNeeded(at currentTime: Date) {
+        let enoughTimePassed = lastWidgetSnapshotSaveAt.map {
+            currentTime.timeIntervalSince($0) >= 30
+        } ?? true
+        guard enoughTimePassed else { return }
+
+        WidgetSnapshotStore.save(info: info, updatedAt: currentTime)
+        lastWidgetSnapshotSaveAt = currentTime
+    }
+
+    private func reloadWidgetIfNeeded(at currentTime: Date) {
         #if canImport(WidgetKit)
-        let oldSignature = WidgetReloadSignature(info: previousInfo, usedFallbackEstimate: previousFallback)
         let newSignature = WidgetReloadSignature(info: info, usedFallbackEstimate: usedFallbackEstimate)
 
-        let changed = oldSignature != newSignature
-        let neverReloaded = lastWidgetReloadSignature == nil
-        let currentTime = now()
+        let changedSinceLastReload = lastWidgetReloadSignature != newSignature
         let enoughTimePassed = lastWidgetReloadAt.map { currentTime.timeIntervalSince($0) >= 30 } ?? true
 
-        guard (changed || neverReloaded), enoughTimePassed else { return }
+        guard changedSinceLastReload, enoughTimePassed else { return }
 
         WidgetCenter.shared.reloadTimelines(ofKind: "BatteryDataWidget")
         lastWidgetReloadAt = currentTime

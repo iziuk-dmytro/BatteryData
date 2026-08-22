@@ -82,6 +82,7 @@ struct SettingsView: View {
             // ── Status Bar ───────────────────────────────────────────────────────────
             Section("Status Bar") {
                 Toggle("Expanded battery info in status bar", isOn: $expandedInfo)
+                Toggle("Show power in expanded status", isOn: $showW)
             }
 
             // ── History Chart ────────────────────────────────────────────────────────

@@ -93,6 +93,8 @@ struct DeviceBatteryStore {
             devices[idx].sources.remove(.ioBluetooth)
             devices[idx].isConnected = devices[idx].sources.contains(.ble)
         }
+
+        devices.removeAll { $0.sources.isEmpty }
     }
 
     mutating func applyBLEUpdate(_ update: BLEBatteryUpdate, now: Date) {
@@ -127,6 +129,9 @@ struct DeviceBatteryStore {
         devices[idx].sources.remove(.ble)
         devices[idx].peripheralIdentifier = nil
         devices[idx].isConnected = devices[idx].sources.contains(.ioBluetooth)
+        if devices[idx].sources.isEmpty {
+            devices.remove(at: idx)
+        }
     }
 
     mutating func enrichMissingBattery(from jsonData: Data, now: Date) {
@@ -164,8 +169,12 @@ struct DeviceBatteryStore {
 
         if let index {
             devices[index].name = trimmedName
-            devices[index].sources.insert(source)
-            devices[index].isConnected = isConnected || !devices[index].sources.isEmpty
+            if isConnected {
+                devices[index].sources.insert(source)
+            } else {
+                devices[index].sources.remove(source)
+            }
+            devices[index].isConnected = devices[index].sources.isEmpty == false
             devices[index].lastUpdated = now
 
             if let batteryPercent {
@@ -179,6 +188,8 @@ struct DeviceBatteryStore {
             }
             return
         }
+
+        guard isConnected else { return }
 
         devices.append(
             DeviceBatteryInfo(
@@ -283,33 +294,48 @@ final class DevicesBatteryViewModel: NSObject, ObservableObject {
     private var refreshDebounceTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
     private var refreshGeneration = 0
+    private var isRunning = false
 
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: nil)
     }
 
-    deinit {
+    isolated deinit {
         refreshDebounceTask?.cancel()
         refreshTask?.cancel()
 
-        Task { @MainActor [weak self] in
-            self?.stop()
+        connectNotification?.unregister()
+        for notification in disconnectNotifications.values {
+            notification.unregister()
+        }
+        central?.delegate = nil
+        for peripheral in peripherals.values {
+            peripheral.delegate = nil
         }
     }
 
     func start() {
+        guard isRunning == false else { return }
+        isRunning = true
         setupIOBluetoothNotifications()
         refresh()
     }
 
     func stop() {
+        isRunning = false
+        refreshGeneration += 1
         refreshDebounceTask?.cancel()
         refreshDebounceTask = nil
         refreshTask?.cancel()
         refreshTask = nil
 
+        for (identifier, characteristic) in batteryChars {
+            guard let peripheral = peripherals[identifier], peripheral.state == .connected else { continue }
+            peripheral.setNotifyValue(false, for: characteristic)
+        }
         peripherals.values.forEach { peripheral in
+            peripheral.delegate = nil
             central.cancelPeripheralConnection(peripheral)
         }
         peripherals.removeAll()
@@ -323,6 +349,7 @@ final class DevicesBatteryViewModel: NSObject, ObservableObject {
     }
 
     func refresh() {
+        guard isRunning else { return }
         refreshGeneration += 1
         let generation = refreshGeneration
 
@@ -413,6 +440,7 @@ final class DevicesBatteryViewModel: NSObject, ObservableObject {
     }
 
     private func registerDisconnect(for device: IOBluetoothDevice) {
+        guard isRunning else { return }
         guard
             let address = DeviceBatteryStore.normalizedAddress(device.addressString),
             disconnectNotifications[address] == nil
@@ -450,11 +478,13 @@ final class DevicesBatteryViewModel: NSObject, ObservableObject {
     }
 
     @objc private func iobtDeviceConnected(_ notification: IOBluetoothUserNotification, device: IOBluetoothDevice) {
+        guard isRunning else { return }
         registerDisconnect(for: device)
         scheduleRefresh()
     }
 
     @objc private func iobtDeviceDisconnected(_ notification: IOBluetoothUserNotification, device: IOBluetoothDevice) {
+        guard isRunning else { return }
         if let address = DeviceBatteryStore.normalizedAddress(device.addressString),
            let notification = disconnectNotifications[address] {
             notification.unregister()
@@ -509,10 +539,9 @@ final class DevicesBatteryViewModel: NSObject, ObservableObject {
 
 extension DevicesBatteryViewModel: CBCentralManagerDelegate {
     nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        Task { @MainActor in
-            if central.state == .poweredOn {
-                refresh()
-            }
+        Task { @MainActor [weak self] in
+            guard let self, self.isRunning, central.state == .poweredOn else { return }
+            self.refresh()
         }
     }
 
@@ -526,7 +555,10 @@ extension DevicesBatteryViewModel: CBCentralManagerDelegate {
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        peripheral.discoverServices([CBUUID(string: devicesBatteryServiceID)])
+        Task { @MainActor [weak self] in
+            guard let self, self.isRunning else { return }
+            peripheral.discoverServices([CBUUID(string: devicesBatteryServiceID)])
+        }
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
@@ -534,11 +566,12 @@ extension DevicesBatteryViewModel: CBCentralManagerDelegate {
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        Task { @MainActor in
-            peripherals.removeValue(forKey: peripheral.identifier)
-            batteryChars.removeValue(forKey: peripheral.identifier)
-            store.removeBLEPeripheral(peripheral.identifier)
-            syncConnectedDevices()
+        Task { @MainActor [weak self] in
+            guard let self, self.isRunning else { return }
+            self.peripherals.removeValue(forKey: peripheral.identifier)
+            self.batteryChars.removeValue(forKey: peripheral.identifier)
+            self.store.removeBLEPeripheral(peripheral.identifier)
+            self.syncConnectedDevices()
         }
     }
 }
@@ -548,13 +581,15 @@ extension DevicesBatteryViewModel: CBCentralManagerDelegate {
 extension DevicesBatteryViewModel: CBPeripheralDelegate {
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard error == nil else { return }
-        guard let services = peripheral.services else { return }
+        Task { @MainActor [weak self] in
+            guard let self, self.isRunning, let services = peripheral.services else { return }
 
-        let batteryService = CBUUID(string: devicesBatteryServiceID)
-        let batteryLevelCharacteristic = CBUUID(string: devicesBatteryLevelCharacteristicID)
+            let batteryService = CBUUID(string: devicesBatteryServiceID)
+            let batteryLevelCharacteristic = CBUUID(string: devicesBatteryLevelCharacteristicID)
 
-        for service in services where service.uuid == batteryService {
-            peripheral.discoverCharacteristics([batteryLevelCharacteristic], for: service)
+            for service in services where service.uuid == batteryService {
+                peripheral.discoverCharacteristics([batteryLevelCharacteristic], for: service)
+            }
         }
     }
 
@@ -565,12 +600,13 @@ extension DevicesBatteryViewModel: CBPeripheralDelegate {
     ) {
         guard error == nil else { return }
 
-        Task { @MainActor in
+        Task { @MainActor [weak self] in
+            guard let self, self.isRunning else { return }
             guard let characteristics = service.characteristics else { return }
             let batteryLevelCharacteristic = CBUUID(string: devicesBatteryLevelCharacteristicID)
 
             for characteristic in characteristics where characteristic.uuid == batteryLevelCharacteristic {
-                batteryChars[peripheral.identifier] = characteristic
+                self.batteryChars[peripheral.identifier] = characteristic
                 peripheral.readValue(for: characteristic)
                 peripheral.setNotifyValue(true, for: characteristic)
             }
@@ -586,16 +622,18 @@ extension DevicesBatteryViewModel: CBPeripheralDelegate {
         let batteryLevelCharacteristic = CBUUID(string: devicesBatteryLevelCharacteristicID)
         guard characteristic.uuid == batteryLevelCharacteristic else { return }
         guard let data = characteristic.value, let firstByte = data.first else { return }
+        guard (0...100).contains(firstByte) else { return }
 
-        Task { @MainActor in
+        Task { @MainActor [weak self] in
+            guard let self, self.isRunning else { return }
             let update = BLEBatteryUpdate(
                 name: peripheral.name ?? "BLE device",
                 peripheralIdentifier: peripheral.identifier,
                 batteryPercent: Int(firstByte),
                 isConnected: true
             )
-            store.applyBLEUpdate(update, now: Date())
-            syncConnectedDevices()
+            self.store.applyBLEUpdate(update, now: Date())
+            self.syncConnectedDevices()
         }
     }
 }
@@ -607,7 +645,11 @@ private extension IOBluetoothDevice {
         guard responds(to: Selector(("batteryPercent"))) else { return nil }
 
         return ObjC.catchException {
-            (self.value(forKey: "batteryPercent") as? NSNumber)?.intValue
+            guard let value = (self.value(forKey: "batteryPercent") as? NSNumber)?.intValue,
+                  (0...100).contains(value) else {
+                return nil
+            }
+            return value
         }
     }
 }

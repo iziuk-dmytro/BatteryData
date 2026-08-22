@@ -8,13 +8,6 @@
 import SwiftUI
 import Charts
 
-struct HistorySample: Identifiable {
-    let t: Date
-    let percent: Int?
-    let watts: Double?
-    var id: Date { t }
-}
-
 private struct PercentPoint: Identifiable {
     let t: Date
     let p: Int

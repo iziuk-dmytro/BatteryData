@@ -5,9 +5,11 @@
 //  Created by Dmytro Izyuk on 11.09.2025.
 //
 
+import Foundation
 import Testing
 @testable import BatteryData
 
+@MainActor
 struct BatteryDataTests {
 
     @Test func parseBatteryMatchesNormalizedAddress() throws {
@@ -18,7 +20,7 @@ struct BatteryDataTests {
               "device_connected": [
                 {
                   "AirPods Pro": {
-                    "device_address": "A8:91:3D:0C:EB:EA",
+                    "device_address": "A8-91-3D-0C-EB-EA",
                     "device_batteryLevelLeft": "94%",
                     "device_batteryLevelRight": "91%",
                     "device_batteryLevelCase": "67%"
@@ -32,7 +34,7 @@ struct BatteryDataTests {
 
         let result = SystemProfilerBluetoothReader.parseBattery(
             jsonData: json,
-            address: "a8-91-3d-0c-eb-ea",
+            address: "a8:91:3d:0c:eb:ea",
             deviceName: nil
         )
 
@@ -94,12 +96,12 @@ struct BatteryDataTests {
         #expect(result == nil)
     }
 
-    @Test func displayBatteryPercentAveragesAvailableComponentReadings() throws {
+    @Test func displayBatteryPercentAveragesEarbudsWithoutCase() throws {
         let snapshot = AirPodsBatterySnapshot(device: nil, left: 94, right: 91, casePct: 67)
 
         let result = SystemProfilerBluetoothReader.displayBatteryPercent(from: snapshot)
 
-        #expect(result == 84)
+        #expect(result == 93)
     }
 
     @Test func displayBatteryPercentUsesSingleAvailableReading() throws {
@@ -108,6 +110,14 @@ struct BatteryDataTests {
         let result = SystemProfilerBluetoothReader.displayBatteryPercent(from: snapshot)
 
         #expect(result == 88)
+    }
+
+    @Test func displayBatteryPercentFallsBackToCase() throws {
+        let snapshot = AirPodsBatterySnapshot(device: nil, left: nil, right: nil, casePct: 67)
+
+        let result = SystemProfilerBluetoothReader.displayBatteryPercent(from: snapshot)
+
+        #expect(result == 67)
     }
 
     @Test func deviceBatteryStoreMergesIOBluetoothAndBLEIntoSingleDevice() throws {
@@ -180,8 +190,31 @@ struct BatteryDataTests {
         #expect(store.connectedDevices.first?.name == "Beats Solo Buds")
         #expect(store.connectedDevices.first?.batteryPercent == 64)
     }
+
+    @Test func deviceBatteryStorePrunesDisconnectedBLEDevice() throws {
+        var store = DeviceBatteryStore()
+        let peripheralID = UUID()
+
+        store.applyBLEUpdate(
+            BLEBatteryUpdate(
+                name: "AirPods Pro",
+                peripheralIdentifier: peripheralID,
+                batteryPercent: 80,
+                isConnected: true
+            ),
+            now: Date()
+        )
+        store.removeBLEPeripheral(peripheralID)
+
+        #expect(store.devices.isEmpty)
+    }
     
     @Test func batteryViewModelUsesFallbackEtaFromPercentageTrend() throws {
+        let suiteName = "BatteryDataTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.set(15.0, forKey: PrefKeys.estimationWindowMin)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
         var samples = [
             BatteryInfo(
                 percentage: 80, isCharging: false, onACPower: false,
@@ -203,6 +236,7 @@ struct BatteryDataTests {
         
         let vm = BatteryViewModel(
             autoStart: false,
+            defaults: defaults,
             readBatteryInfo: { samples.removeFirst() },
             notify: { _, _ in },
             now: { currentDate }
@@ -296,7 +330,7 @@ struct BatteryDataTests {
         vm.refresh()
         vm.refresh()
         
-        #expect(notifications.map(\.0) == ["Low Battery", "Low Battery", "Low Battery", "Low Battery", "Low Battery", "Low Battery"])
+        #expect(notifications.map(\.0) == ["Low Battery", "Low Battery", "Low Battery", "Low Battery"])
     }
     
     @Test func batteryViewModelDetectsPowerSpikeAfterTenSeconds() throws {
@@ -332,6 +366,79 @@ struct BatteryDataTests {
         vm.refresh()
         
         #expect(notifications.contains { $0.0 == "Power Spike" })
+    }
+
+    @Test func etaEstimatorUsesOnlyCurrentBatterySession() throws {
+        let now = Date(timeIntervalSince1970: 20_000)
+        let history = [
+            makeSnapshot(at: now.addingTimeInterval(-600), level: 20, state: .charging),
+            makeSnapshot(at: now.addingTimeInterval(-300), level: 90, state: .unplugged),
+        ]
+        let current = makeSnapshot(at: now, level: 89, state: .unplugged)
+
+        let result = BatteryETAEstimator.applyingEstimate(to: current, history: history)
+
+        #expect(result.timeToEmptyMinutes == 445)
+        #expect(result.etaSource == .estimated)
+    }
+
+    @Test func historyStoreSerializesWritersForSameFile() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BatteryDataTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let firstStore = JSONBatteryHistoryStore(filename: "history.json", baseDirectory: directory)
+        let secondStore = JSONBatteryHistoryStore(filename: "history.json", baseDirectory: directory)
+        let first = makeSnapshot(at: Date(timeIntervalSince1970: 30_000), level: 40, state: .unplugged)
+        let second = makeSnapshot(at: Date(timeIntervalSince1970: 30_001), level: 41, state: .charging)
+
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { _ = try? firstStore.append(first) }
+            group.addTask { _ = try? secondStore.append(second) }
+        }
+
+        #expect(firstStore.loadSnapshots().map(\.batteryLevel) == [40, 41])
+    }
+
+    @Test func historyStoreDoesNotOverwriteCorruptFile() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BatteryDataTests-\(UUID().uuidString)", isDirectory: true)
+        let fileURL = directory.appendingPathComponent("history.json")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let corruptData = Data("not-json".utf8)
+        try corruptData.write(to: fileURL)
+
+        let store = JSONBatteryHistoryStore(filename: "history.json", baseDirectory: directory)
+        _ = try? store.append(makeSnapshot(at: Date(), level: 50, state: .unplugged))
+
+        #expect(try Data(contentsOf: fileURL) == corruptData)
+    }
+
+    private func makeSnapshot(
+        at timestamp: Date,
+        level: Int,
+        state: BatteryChargeState
+    ) -> BatterySnapshot {
+        BatterySnapshot(
+            timestamp: timestamp,
+            batteryLevel: level,
+            chargeState: state,
+            isLowPowerModeEnabled: false,
+            voltageMillivolts: nil,
+            amperageMilliamps: nil,
+            watts: nil,
+            cycleCount: nil,
+            designCapacitymAh: nil,
+            maxCapacitymAh: nil,
+            currentCapacitymAh: nil,
+            healthPercent: nil,
+            timeToEmptyMinutes: nil,
+            timeToFullMinutes: nil,
+            etaSource: nil,
+            lowLevelSourceDescription: nil
+        )
     }
 
 }

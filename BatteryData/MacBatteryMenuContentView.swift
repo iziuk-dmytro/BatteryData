@@ -16,6 +16,13 @@ struct MacBatteryMenuContentView: View {
     @State private var launchAtLogin = (SMAppService.mainApp.status == .enabled)
     @State private var launchError: String?
 
+    private static let capacityFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.maximumFractionDigits = 0
+        return formatter
+    }()
+
     // MARK: - Helpers
 
     private func wattsText(_ w: Double?) -> String {
@@ -26,11 +33,7 @@ struct MacBatteryMenuContentView: View {
 
     private func formatmAh(_ v: Int?) -> String {
         guard let v else { return "—" }
-        let f = NumberFormatter()
-        f.numberStyle = .decimal
-        f.groupingSeparator = " "
-        f.maximumFractionDigits = 0
-        return (f.string(from: NSNumber(value: v)) ?? "\(v)") + " mAh"
+        return (Self.capacityFormatter.string(from: NSNumber(value: v)) ?? "\(v)") + " mAh"
     }
 
     private func showSettingsWindow() {
