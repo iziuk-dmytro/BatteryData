@@ -19,6 +19,7 @@ final class BatteryViewModel: ObservableObject {
     
     private var timer: AnyCancellable?
     private var defaultsObserver: Any?
+    private var autoRefreshEnabled: Bool
     
     // Notifications
     private var lowNotified: Set<Int> = []
@@ -71,6 +72,7 @@ final class BatteryViewModel: ObservableObject {
         now: @escaping () -> Date = Date.init
     ) {
         self.defaults = defaults
+        self.autoRefreshEnabled = autoStart
         self.readBatteryInfo = readBatteryInfo
         self.notify = notify
         self.now = now
@@ -79,8 +81,11 @@ final class BatteryViewModel: ObservableObject {
             forName: UserDefaults.didChangeNotification, object: defaults, queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.restartTimerIfNeeded()
-                self?.objectWillChange.send()
+                guard let self else { return }
+                if self.autoRefreshEnabled {
+                    self.restartTimerIfNeeded()
+                }
+                self.objectWillChange.send()
             }
         }
         if autoStart {
@@ -110,6 +115,7 @@ final class BatteryViewModel: ObservableObject {
     }
     
     func startAutoRefresh() {
+        autoRefreshEnabled = true
         timer?.cancel()
         lastInterval = clampedRefreshInterval()
         refresh() // миттєве оновлення після зміни налаштувань
@@ -318,6 +324,7 @@ final class BatteryViewModel: ObservableObject {
     }
 
     private func persistWidgetSnapshotIfNeeded(at currentTime: Date) {
+        guard autoRefreshEnabled else { return }
         let enoughTimePassed = lastWidgetSnapshotSaveAt.map {
             currentTime.timeIntervalSince($0) >= 30
         } ?? true
@@ -329,6 +336,7 @@ final class BatteryViewModel: ObservableObject {
 
     private func reloadWidgetIfNeeded(at currentTime: Date) {
         #if canImport(WidgetKit)
+        guard autoRefreshEnabled else { return }
         let newSignature = WidgetReloadSignature(info: info, usedFallbackEstimate: usedFallbackEstimate)
 
         let changedSinceLastReload = lastWidgetReloadSignature != newSignature
