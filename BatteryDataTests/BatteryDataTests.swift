@@ -9,8 +9,42 @@ import Foundation
 import Testing
 @testable import BatteryData
 
+private final class UncheckedSendableBox<Value>: @unchecked Sendable {
+    let value: Value
+
+    init(_ value: Value) {
+        self.value = value
+    }
+}
+
 @MainActor
 struct BatteryDataTests {
+
+    @Test func ioBluetoothCallbacksAcceptBackgroundDelivery() async {
+        let viewModel = DevicesBatteryViewModel()
+        let viewModelBox = UncheckedSendableBox(viewModel)
+        let selectorNames = [
+            "iobtDeviceConnected:device:",
+            "iobtDeviceDisconnected:device:"
+        ]
+
+        for selectorName in selectorNames {
+            #expect(viewModel.responds(to: NSSelectorFromString(selectorName)))
+        }
+
+        await Task.detached {
+            let notification = NSObject()
+            let device = NSObject()
+
+            for selectorName in selectorNames {
+                _ = viewModelBox.value.perform(
+                    NSSelectorFromString(selectorName),
+                    with: notification,
+                    with: device
+                )
+            }
+        }.value
+    }
 
     @Test func parseBatteryMatchesNormalizedAddress() throws {
         let json = """

@@ -1,6 +1,6 @@
 import Foundation
 @preconcurrency import CoreBluetooth
-import IOBluetooth
+@preconcurrency import IOBluetooth
 
 private let devicesBatteryServiceID = "180F"
 private let devicesBatteryLevelCharacteristicID = "2A19"
@@ -477,20 +477,30 @@ final class DevicesBatteryViewModel: NSObject, ObservableObject {
         }
     }
 
-    @objc private func iobtDeviceConnected(_ notification: IOBluetoothUserNotification, device: IOBluetoothDevice) {
-        guard isRunning else { return }
-        registerDisconnect(for: device)
-        scheduleRefresh()
+    @objc nonisolated private func iobtDeviceConnected(
+        _ notification: IOBluetoothUserNotification,
+        device: IOBluetoothDevice
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self, self.isRunning else { return }
+            self.registerDisconnect(for: device)
+            self.scheduleRefresh()
+        }
     }
 
-    @objc private func iobtDeviceDisconnected(_ notification: IOBluetoothUserNotification, device: IOBluetoothDevice) {
-        guard isRunning else { return }
-        if let address = DeviceBatteryStore.normalizedAddress(device.addressString),
-           let notification = disconnectNotifications[address] {
-            notification.unregister()
-            disconnectNotifications.removeValue(forKey: address)
+    @objc nonisolated private func iobtDeviceDisconnected(
+        _ notification: IOBluetoothUserNotification,
+        device: IOBluetoothDevice
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self, self.isRunning else { return }
+            if let address = DeviceBatteryStore.normalizedAddress(device.addressString),
+               let notification = self.disconnectNotifications[address] {
+                notification.unregister()
+                self.disconnectNotifications.removeValue(forKey: address)
+            }
+            self.scheduleRefresh()
         }
-        scheduleRefresh()
     }
 
     private func isLikelyHeadphonesName(_ name: String) -> Bool {
